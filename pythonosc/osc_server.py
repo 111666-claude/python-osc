@@ -5,11 +5,12 @@ import os
 import socket
 import socketserver
 from socket import socket as _socket
-from typing import Any, Coroutine, Tuple, Union, cast
+from typing import Any, Coroutine, List, Tuple, Union, cast
 
 from pythonosc import osc_bundle, osc_message
 from pythonosc.dispatcher import Dispatcher
 from pythonosc.osc_message_builder import build_msg
+from pythonosc.scheduling import AsyncIOEventScheduler
 
 _RequestType = Union[_socket, Tuple[bytes, _socket]]
 _AddressType = Union[Tuple[str, int], str]
@@ -184,7 +185,24 @@ class AsyncIOOSCUDPServer:
         def datagram_received(
             self, data: bytes, client_address: Tuple[str, int]
         ) -> None:
-            resp = self.dispatcher.call_handlers_for_packet(data, client_address)
+            # Use the asyncio path when the dispatcher owns an asyncio
+            # scheduler, so deferred messages are driven by the event loop;
+            # keep the synchronous path (and its replies) otherwise.
+            if isinstance(self.dispatcher.scheduler, AsyncIOEventScheduler):
+                asyncio.ensure_future(self._handle_async(data, client_address))
+            else:
+                resp = self.dispatcher.call_handlers_for_packet(data, client_address)
+                self._send_replies(resp, client_address)
+
+        async def _handle_async(
+            self, data: bytes, client_address: Tuple[str, int]
+        ) -> None:
+            resp = await self.dispatcher.async_call_handlers_for_packet(
+                data, client_address
+            )
+            self._send_replies(resp, client_address)
+
+        def _send_replies(self, resp: List, client_address: Tuple[str, int]) -> None:
             for r in resp:
                 if not isinstance(r, tuple):
                     r = [r]

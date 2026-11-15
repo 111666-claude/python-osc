@@ -126,6 +126,64 @@ The handler must have the same signature as map callbacks:
     def some_callback(address: str, *osc_arguments: ArgValue) -> None: ...
 
 
+Bounded Scheduling of Future Timetags
+---------------------------------------
+
+The default ``strict_timing`` behaviour sleeps on the receive path until a future
+timetag is reached.  A device that bursts thousands of future-dated messages (a
+lighting console uploading a cue list, for example) would therefore block
+processing or, with the threading server, create an unbounded number of sleeping
+threads.
+
+Pass a bounded scheduler to the dispatcher to instead accept every message
+immediately and invoke its callbacks later, when the timetag becomes due:
+
+.. code-block:: python
+
+    from pythonosc.dispatcher import Dispatcher
+    from pythonosc.scheduling import (
+        ThreadEventScheduler,       # for the synchronous servers
+        AsyncIOEventScheduler,      # for the asyncio servers
+        OverflowPolicy,
+        ClosePolicy,
+    )
+
+    scheduler = ThreadEventScheduler(
+        capacity=10000,                          # bounded pending queue
+        overflow_policy=OverflowPolicy.REJECT,  # what to do when full
+        close_policy=ClosePolicy.CANCEL_PENDING,
+    )
+    disp = Dispatcher(scheduler=scheduler)
+
+Properties of the scheduled mode:
+
+* The receive path never waits on a timetag; a single scheduler thread plus a
+  bounded worker pool run the callbacks, so slow callbacks neither block
+  reception nor grow the thread count.  The asyncio scheduler runs everything on
+  the event loop and creates no threads.
+* Messages whose timetag is already in the past and IMMEDIATELY bundles still
+  fire at once; nested-bundle timetags and the original ordering of messages
+  sharing a timetag are preserved.
+* ``capacity`` bounds the pending queue.  On overflow you can ``REJECT`` the new
+  event (``schedule`` returns ``None``), ``RAISE`` ``QueueFullError``,
+  ``DROP_OLDEST`` or ``DROP_NEWEST``.
+* On ``close``/``aclose`` pending events are either cancelled (default), flushed
+  immediately (``FLUSH``) or allowed to run at their scheduled time
+  (``WAIT_PENDING``).  The return value is the number of events left unexecuted.
+* ``scheduler.stats()`` returns a ``SchedulerStats`` snapshot (pending, fired,
+  cancelled, dropped, rejected, error counts) and an optional ``listener``
+  callback observes every event lifecycle transition.
+* Pending events are cancellable: keep the handle returned by ``schedule()`` and
+  call ``handle.cancel()``, or cancel everything with
+  ``disp.cancel_scheduled()``.
+* The clock is injectable (``clock=``), which makes scheduling, cancellation and
+  shutdown fully deterministic in tests.
+
+When a scheduler is configured it takes precedence over ``strict_timing`` for
+future timetags only; the original immediate and strict-timing modes are
+unchanged when no scheduler is supplied.
+
+
 Handler Responses
 -----------------
 

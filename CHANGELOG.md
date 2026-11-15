@@ -5,6 +5,8 @@ The format is based on [Keep a Changelog](http://keepachangelog.com/) and this p
 
 ## Unreleased
 
+- Added an optional bounded, non-blocking scheduling mode (`pythonosc.scheduling`) for messages with future timetags: `Dispatcher(scheduler=...)` accepts messages immediately and fires their callbacks when the timetag is due, with a bounded queue (`ThreadEventScheduler` for synchronous servers, `AsyncIOEventScheduler` for asyncio), configurable overflow and close policies, stats/lifecycle observability, per-event and bulk cancellation, and an injectable clock. Existing immediate and strict-timing modes are unchanged when no scheduler is supplied.
+- `osc_packet.TimedMessage` now carries the unclamped bundle timetag as `raw_time` (`None` for IMMEDIATELY/bare messages) alongside the existing clamped `time`.
 - Preserve explicit empty-string arguments in message helpers and TCP clients while keeping omitted values argument-free.
 
 ## [1.10.2]

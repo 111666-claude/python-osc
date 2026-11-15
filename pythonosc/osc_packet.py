@@ -9,17 +9,24 @@ from pythonosc.parsing import osc_types
 from pythonosc import osc_bundle
 from pythonosc import osc_message
 
-from typing import List, NamedTuple
+from typing import List, NamedTuple, Optional
 
 # A namedtuple as returned my the _timed_msg_of_bundle function.
 # 1) the system time at which the message should be executed
-#    in seconds since the epoch.
+#    in seconds since the epoch (clamped to "now" for past timetags and
+#    IMMEDIATELY, so consumers that simply sort by time fire stale messages at
+#    once).
 # 2) the actual message.
+# 3) the raw timetag carried by the enclosing bundle in seconds since the
+#    epoch, unclamped, or None for the IMMEDIATELY sentinel / a bare message.
+#    This lets a scheduler driving its own clock tell a genuine future timetag
+#    apart from IMMEDIATELY regardless of when the packet was parsed.
 TimedMessage = NamedTuple(
     "TimedMessage",
     [
         ("time", float),
         ("message", osc_message.OscMessage),
+        ("raw_time", Optional[float]),
     ],
 )
 
@@ -31,10 +38,15 @@ def _timed_msg_of_bundle(
     msgs = []
     for content in bundle:
         if type(content) is osc_message.OscMessage:
-            if bundle.timestamp == osc_types.IMMEDIATELY or bundle.timestamp < now:
-                msgs.append(TimedMessage(now, content))
+            if bundle.timestamp == osc_types.IMMEDIATELY:
+                msgs.append(TimedMessage(now, content, None))
+            elif bundle.timestamp < now:
+                # Stale messages are clamped onto "now" so plain consumers fire
+                # them at once, but raw_time keeps the unclamped timetag for
+                # schedulers driving their own clock.
+                msgs.append(TimedMessage(now, content, float(bundle.timestamp)))
             else:
-                msgs.append(TimedMessage(bundle.timestamp, content))
+                msgs.append(TimedMessage(bundle.timestamp, content, bundle.timestamp))
         else:
             msgs.extend(_timed_msg_of_bundle(content, now))
     return msgs
@@ -68,7 +80,9 @@ class OscPacket(object):
                     key=lambda x: x.time,
                 )
             elif osc_message.OscMessage.dgram_is_message(dgram):
-                self._messages = [TimedMessage(now, osc_message.OscMessage(dgram))]
+                self._messages = [
+                    TimedMessage(now, osc_message.OscMessage(dgram), None)
+                ]
             else:
                 # Empty packet, should not happen as per the spec but heh, UDP...
                 raise ParseError(

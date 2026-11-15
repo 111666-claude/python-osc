@@ -21,6 +21,7 @@ from typing import (
 )
 from pythonosc.osc_message import OscMessage
 from pythonosc.osc_message_builder import ArgValue
+from pythonosc.scheduling import EventScheduler
 
 
 class Handler(object):
@@ -128,20 +129,49 @@ class Dispatcher(object):
     Maps OSC addresses to handler functions and invokes the correct handler when a message comes in.
     """
 
-    def __init__(self, strict_timing: bool = True) -> None:
+    def __init__(
+        self,
+        strict_timing: bool = True,
+        scheduler: Optional[EventScheduler] = None,
+    ) -> None:
         """Initialize the dispatcher.
 
         Args:
             strict_timing: Whether to automatically schedule messages with future timetags.
-                If True (default), the dispatcher will wait (using sleep) until the specified
-                timetag before invoking handlers.
+                If True (default) and no ``scheduler`` is given, the dispatcher will wait
+                (using sleep) until the specified timetag before invoking handlers.
                 If False, messages are dispatched immediately regardless of their timetag.
                 Disabling this can prevent memory/thread accumulation issues when receiving
                 many future-dated messages.
+            scheduler: Optional bounded scheduler
+                (:class:`~pythonosc.scheduling.ThreadEventScheduler` for the synchronous
+                servers, :class:`~pythonosc.scheduling.AsyncIOEventScheduler` for the
+                asyncio ones).  When provided, messages with future timetags are enqueued
+                and fired later without blocking the receive path, with a bounded queue,
+                configurable overflow/close policies, observability and cancellation.
+                It takes precedence over ``strict_timing`` for future timetags; stale
+                messages and IMMEDIATELY bundles still fire at once.
         """
         self._map: DefaultDict[str, List[Handler]] = collections.defaultdict(list)
         self._default_handler: Optional[Handler] = None
         self._strict_timing = strict_timing
+        self._scheduler = scheduler
+
+    @property
+    def scheduler(self) -> Optional[EventScheduler]:
+        """The bounded scheduler future timetags are handed to, if any."""
+        return self._scheduler
+
+    def cancel_scheduled(self) -> int:
+        """Cancel every event still pending in the scheduler.
+
+        Returns:
+            The number of events cancelled.  Returns 0 when no scheduler is
+            configured.
+        """
+        if self._scheduler is None:
+            return 0
+        return self._scheduler.cancel_all()
 
     def map(
         self,
@@ -304,6 +334,37 @@ class Dispatcher(object):
             logging.debug("No handler matched but default handler present, added it.")
             yield self._default_handler
 
+    def _invoke_handlers(
+        self,
+        handlers: List[Handler],
+        client_address: Tuple[str, int],
+        message: OscMessage,
+        results: List,
+    ) -> None:
+        """Invoke matching handlers synchronously, collecting reply results.
+
+        Exceptions raised by a handler propagate to the caller, exactly as in
+        the immediate/strict-timing paths; isolation for deferred callbacks is
+        provided by the scheduler itself.
+        """
+        for handler in handlers:
+            result = handler.invoke(client_address, message)
+            if result is not None:
+                results.append(result)
+
+    async def _async_invoke_handlers(
+        self,
+        handlers: List[Handler],
+        client_address: Tuple[str, int],
+        message: OscMessage,
+        results: List,
+    ) -> None:
+        """Invoke matching handlers, awaiting coroutine callbacks."""
+        for handler in handlers:
+            result = await handler.async_invoke(client_address, message)
+            if result is not None:
+                results.append(result)
+
     def call_handlers_for_packet(
         self, data: bytes, client_address: Tuple[str, int]
     ) -> List:
@@ -314,24 +375,27 @@ class Dispatcher(object):
         Args:
             data: Data of packet
             client_address: Address of client this packet originated from
-        Returns: A list of strings or tuples to be converted to OSC messages and returned to the client
+        Returns: A list of strings or tuples to be converted to OSC messages and returned to the client.
+            Replies can only be produced for messages dispatched immediately; messages deferred to a
+            scheduler are fire-and-forget.
         """
-        results = list()
+        results: List = list()
         # Get OSC messages from all bundles or standalone message.
         try:
             packet = osc_packet.OscPacket(data)
             for timed_msg in packet.messages:
-                now = time.time()
-                handlers = self.handlers_for_address(timed_msg.message.address)
+                handlers = list(self.handlers_for_address(timed_msg.message.address))
                 if not handlers:
                     continue
+                if self._defer_if_future(timed_msg, handlers, client_address):
+                    # Bounded, non-blocking mode: accepted now, fires later.
+                    continue
                 # If the message is to be handled later, then so be it.
-                if self._strict_timing and timed_msg.time > now:
-                    time.sleep(timed_msg.time - now)
-                for handler in handlers:
-                    result = handler.invoke(client_address, timed_msg.message)
-                    if result is not None:
-                        results.append(result)
+                if self._strict_timing and timed_msg.time > time.time():
+                    time.sleep(timed_msg.time - time.time())
+                self._invoke_handlers(
+                    handlers, client_address, timed_msg.message, results
+                )
         except osc_packet.ParseError:
             pass
         return results
@@ -351,29 +415,84 @@ class Dispatcher(object):
         if no parameters were registered, then it is just called like this:
           handler('/address that triggered the message',
                   osc_msg_arg1, osc_msg_arg2, osc_msg_param3, ...)
+
+        Replies can only be produced for messages dispatched immediately; messages
+        deferred to a scheduler are fire-and-forget.
         """
 
         # Get OSC messages from all bundles or standalone message.
-        results = []
+        results: List = []
         try:
             packet = osc_packet.OscPacket(data)
             for timed_msg in packet.messages:
-                now = time.time()
-                handlers = self.handlers_for_address(timed_msg.message.address)
+                handlers = list(self.handlers_for_address(timed_msg.message.address))
                 if not handlers:
                     continue
+                if await self._adefer_if_future(timed_msg, handlers, client_address):
+                    # Bounded, non-blocking mode: accepted now, fires later.
+                    continue
                 # If the message is to be handled later, then so be it.
-                if self._strict_timing and timed_msg.time > now:
-                    await asyncio.sleep(timed_msg.time - now)
-                for handler in handlers:
-                    result = await handler.async_invoke(
-                        client_address, timed_msg.message
-                    )
-                    if result is not None:
-                        results.append(result)
+                if self._strict_timing and timed_msg.time > time.time():
+                    await asyncio.sleep(timed_msg.time - time.time())
+                await self._async_invoke_handlers(
+                    handlers, client_address, timed_msg.message, results
+                )
         except osc_packet.ParseError:
             pass
         return results
+
+    def _defer_if_future(
+        self,
+        timed_msg: osc_packet.TimedMessage,
+        handlers: List[Handler],
+        client_address: Tuple[str, int],
+    ) -> bool:
+        """Hand a future-timetag message to the synchronous scheduler, if any.
+
+        Returns:
+            True if the message was deferred and must not be dispatched now.
+        """
+        if self._scheduler is None or timed_msg.raw_time is None:
+            return False
+        if timed_msg.raw_time <= self._scheduler.now():
+            return False
+        message = timed_msg.message
+        self._scheduler.schedule(
+            timed_msg.raw_time,
+            lambda: self._invoke_handlers(handlers, client_address, message, []),
+        )
+        return True
+
+    async def _adefer_if_future(
+        self,
+        timed_msg: osc_packet.TimedMessage,
+        handlers: List[Handler],
+        client_address: Tuple[str, int],
+    ) -> bool:
+        """Hand a future-timetag message to the asyncio scheduler, if any.
+
+        Returns:
+            True if the message was deferred and must not be dispatched now.
+        """
+        if self._scheduler is None or timed_msg.raw_time is None:
+            return False
+        if timed_msg.raw_time <= self._scheduler.now():
+            return False
+        message = timed_msg.message
+        self._scheduler.schedule(
+            timed_msg.raw_time,
+            lambda: self._schedule_async(handlers, client_address, message),
+        )
+        return True
+
+    def _schedule_async(
+        self,
+        handlers: List[Handler],
+        client_address: Tuple[str, int],
+        message: OscMessage,
+    ) -> Any:
+        """Entry point used by an AsyncIOEventScheduler for deferred messages."""
+        return self._async_invoke_handlers(handlers, client_address, message, [])
 
     def set_default_handler(
         self, handler: Callable, needs_reply_address: bool = False
