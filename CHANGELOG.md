@@ -5,6 +5,7 @@ The format is based on [Keep a Changelog](http://keepachangelog.com/) and this p
 
 ## Unreleased
 
+- Add `QueuedAsyncTCPClient` and `QueuedAsyncSimpleTCPClient`: async TCP clients with a bounded send queue (message-count and byte limits), a single ordered writer task, configurable wait/error full-queue policy, per-message delivery results, and drain-or-discard shutdown.
 - Preserve explicit empty-string arguments in message helpers and TCP clients while keeping omitted values argument-free.
 
 ## [1.10.2]
