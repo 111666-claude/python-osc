@@ -6,6 +6,7 @@ The format is based on [Keep a Changelog](http://keepachangelog.com/) and this p
 ## Unreleased
 
 - Preserve explicit empty-string arguments in message helpers and TCP clients while keeping omitted values argument-free.
+- Added IPv4 multicast support: `MulticastOSCUDPServer` joins/leaves groups on a chosen local interface, and `UDPClient`/`SimpleUDPClient` accept `multicast_interface`, `multicast_ttl` and `multicast_loop`. Typed errors live in `pythonosc.osc_multicast`.
 
 ## [1.10.2]
 

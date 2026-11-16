@@ -19,6 +19,7 @@ Features
 ========
 
 * UDP and TCP blocking/threading/forking/asyncio server implementations
+* IPv4 multicast UDP server and client (one stream to many receivers)
 * UDP and TCP clients, including asyncio support
 * TCP support for 1.0 and 1.1 protocol formats
 * int, int64, float, string, double, MIDI, timestamps, blob, nil OSC arguments
