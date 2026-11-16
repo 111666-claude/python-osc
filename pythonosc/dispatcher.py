@@ -9,6 +9,7 @@ import time
 from pythonosc import osc_packet
 from typing import (
     overload,
+    Dict,
     List,
     Union,
     Any,
@@ -21,6 +22,102 @@ from typing import (
 )
 from pythonosc.osc_message import OscMessage
 from pythonosc.osc_message_builder import ArgValue
+
+#: Maximum accepted length (in characters) for an address template registered
+#: with Dispatcher.map_template(). Longer templates are rejected.
+MAX_TEMPLATE_LENGTH = 1024
+
+#: Valid names for template parameters (they are passed as keyword arguments).
+_TEMPLATE_PARAM_NAME_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+
+#: Characters that start an OSC address pattern wildcard. They are not allowed
+#: in the literal parts of an address template.
+_OSC_WILDCARD_CHARS = "*?[],"
+
+
+def _compile_address_template(template: str) -> "re.Pattern[str]":
+    """Compiles an address template like '/track/{id}/gain' into a regex.
+
+    Each ``{name}`` segment becomes a named group matching a single non-empty
+    path segment. Literal parts are matched verbatim; OSC wildcard characters
+    are not allowed in templates (use Dispatcher.map() for those).
+
+    Args:
+        template: The address template to compile.
+
+    Returns:
+        A compiled regular expression with one named group per template parameter.
+
+    Raises:
+        ValueError: If the template is malformed (no leading slash, empty
+            segments, unbalanced braces, empty/invalid/duplicate parameter
+            names, OSC wildcard characters in literal parts) or exceeds
+            MAX_TEMPLATE_LENGTH characters.
+    """
+    if not isinstance(template, str) or not template.startswith("/"):
+        raise ValueError(
+            f"Invalid template {template!r}: templates must start with '/'"
+        )
+    if len(template) > MAX_TEMPLATE_LENGTH:
+        raise ValueError(
+            f"Invalid template: {len(template)} characters exceeds the maximum "
+            f"of {MAX_TEMPLATE_LENGTH}"
+        )
+    segments = template.split("/")[1:]
+    if any(segment == "" for segment in segments):
+        raise ValueError(
+            f"Invalid template {template!r}: empty path segments are not allowed"
+        )
+
+    param_names: List[str] = []
+    pattern = "^"
+    i = 0
+    while i < len(template):
+        c = template[i]
+        if c == "{":
+            end = template.find("}", i + 1)
+            if end == -1:
+                raise ValueError(
+                    f"Invalid template {template!r}: unbalanced '{{'"
+                )
+            name = template[i + 1 : end]
+            if not name:
+                raise ValueError(
+                    f"Invalid template {template!r}: empty parameter name"
+                )
+            if not _TEMPLATE_PARAM_NAME_RE.fullmatch(name):
+                raise ValueError(
+                    f"Invalid template {template!r}: {name!r} is not a valid "
+                    "parameter name (must be a Python identifier); note that "
+                    "'{a,b}' OSC alternation is only supported by map(), "
+                    "not by templates"
+                )
+            if name in param_names:
+                raise ValueError(
+                    f"Invalid template {template!r}: duplicate parameter "
+                    f"name {name!r}"
+                )
+            param_names.append(name)
+            pattern += f"(?P<{name}>[^/]+)"
+            i = end + 1
+        elif c == "}":
+            raise ValueError(f"Invalid template {template!r}: unbalanced '}}'")
+        elif c in _OSC_WILDCARD_CHARS:
+            raise ValueError(
+                f"Invalid template {template!r}: OSC wildcard character {c!r} "
+                "is not allowed in templates; use map() for OSC wildcard "
+                "addresses"
+            )
+        elif c in " #":
+            raise ValueError(
+                f"Invalid template {template!r}: character {c!r} is not "
+                "allowed in OSC addresses"
+            )
+        else:
+            pattern += re.escape(c)
+            i += 1
+    pattern += "$"
+    return re.compile(pattern)
 
 
 class Handler(object):
@@ -36,16 +133,21 @@ class Handler(object):
         _callback: Callable,
         _args: Union[Any, List[Any]],
         _needs_reply_address: bool = False,
+        _template_args: Optional[Dict[str, str]] = None,
     ) -> None:
         """
         Args:
             _callback Function that is called when handler is invoked
             _args: Message causing invocation
             _needs_reply_address Whether the client's ip address shall be passed as an argument or not
+            _template_args Named path segment values extracted when the handler was matched
+                through an address template (see Dispatcher.map_template); they are passed to
+                the callback as keyword arguments
         """
         self.callback = _callback
         self.args = _args
         self.needs_reply_address = _needs_reply_address
+        self.template_args = _template_args
 
     # needed for test module
     def __eq__(self, other: Any) -> bool:
@@ -54,6 +156,7 @@ class Handler(object):
             and self.callback == other.callback
             and self.args == other.args
             and self.needs_reply_address == other.needs_reply_address
+            and self.template_args == other.template_args
         )
 
     def invoke(
@@ -68,18 +171,23 @@ class Handler(object):
             The result of the handler function can be None, a string OSC address, or a tuple of the OSC address
             and arguments.
         """
+        template_args = self.template_args or {}
         if self.needs_reply_address:
             if self.args:
                 return self.callback(
-                    client_address, message.address, self.args, *message
+                    client_address, message.address, self.args, *message, **template_args
                 )
             else:
-                return self.callback(client_address, message.address, *message)
+                return self.callback(
+                    client_address, message.address, *message, **template_args
+                )
         else:
             if self.args:
-                return self.callback(message.address, self.args, *message)
+                return self.callback(
+                    message.address, self.args, *message, **template_args
+                )
             else:
-                return self.callback(message.address, *message)
+                return self.callback(message.address, *message, **template_args)
 
     async def async_invoke(
         self, client_address: Tuple[str, int], message: OscMessage
@@ -95,31 +203,48 @@ class Handler(object):
         """
         cb = self.callback
         is_async = inspect.iscoroutinefunction(cb)
+        template_args = self.template_args or {}
 
         if self.needs_reply_address:
             if self.args:
                 if is_async:
                     return await cb(
-                        client_address, message.address, self.args, *message
+                        client_address,
+                        message.address,
+                        self.args,
+                        *message,
+                        **template_args,
                     )
                 else:
-                    return cb(client_address, message.address, self.args, *message)
+                    return cb(
+                        client_address,
+                        message.address,
+                        self.args,
+                        *message,
+                        **template_args,
+                    )
             else:
                 if is_async:
-                    return await cb(client_address, message.address, *message)
+                    return await cb(
+                        client_address, message.address, *message, **template_args
+                    )
                 else:
-                    return cb(client_address, message.address, *message)
+                    return cb(
+                        client_address, message.address, *message, **template_args
+                    )
         else:
             if self.args:
                 if is_async:
-                    return await cb(message.address, self.args, *message)
+                    return await cb(
+                        message.address, self.args, *message, **template_args
+                    )
                 else:
-                    return cb(message.address, self.args, *message)
+                    return cb(message.address, self.args, *message, **template_args)
             else:
                 if is_async:
-                    return await cb(message.address, *message)
+                    return await cb(message.address, *message, **template_args)
                 else:
-                    return cb(message.address, *message)
+                    return cb(message.address, *message, **template_args)
 
 
 class Dispatcher(object):
@@ -140,6 +265,9 @@ class Dispatcher(object):
                 many future-dated messages.
         """
         self._map: DefaultDict[str, List[Handler]] = collections.defaultdict(list)
+        # Address templates registered via map_template(), in registration order.
+        # Each entry maps the template string to [compiled regex, handlers].
+        self._templates: Dict[str, List[Any]] = {}
         self._default_handler: Optional[Handler] = None
         self._strict_timing = strict_timing
 
@@ -184,6 +312,62 @@ class Dispatcher(object):
         # regarding multiple mappings
         handlerobj = Handler(handler, list(args), needs_reply_address)
         self._map[address].append(handlerobj)
+        return handlerobj
+
+    def map_template(
+        self,
+        template: str,
+        handler: Callable,
+        *args: Union[Any, List[Any]],
+        needs_reply_address: bool = False,
+    ) -> Handler:
+        """Map an address template with named path segments to a handler
+
+        A template looks like a regular OSC address except that one or more
+        path segments are written as ``{name}``, e.g. ``/track/{id}/gain``.
+        Each named segment matches a single non-empty path segment of incoming
+        addresses, and its value is passed to the callback as a keyword
+        argument (always a string), in addition to the regular OSC arguments:
+
+        .. code-block:: python
+
+            def some_cb(address: str, *osc_args: ArgValue, id: str) -> Union[None, str, Tuple[str, ArgValue]]: ...
+            def some_cb(address: str, fixed_args: List[Any], *osc_args: ArgValue, id: str) -> Union[None, str, Tuple[str, ArgValue]]: ...
+
+        Templates coexist with the exact addresses and OSC wildcard addresses
+        registered through map(). When several registrations match the same
+        incoming address, all of their handlers are invoked in a stable
+        priority order: exact addresses first, then templates (in registration
+        order), then OSC wildcard addresses.
+
+        Braces in a template always denote named parameters; the OSC
+        ``{a,b}`` alternation wildcard is not supported here (use map() for
+        OSC wildcard addresses), and OSC wildcard characters are rejected in
+        the literal parts of a template.
+
+        Args:
+            template: Address template to be mapped, e.g. '/track/{id}/gain'
+            handler: Callback function that will be called as the handler for
+                matching addresses
+            *args: Fixed arguements that will be passed to the callback function
+            needs_reply_address: Whether the IP address from which the message
+                originated from shall be passed as an argument to the handler
+                callback
+
+        Returns:
+            The handler object that will be invoked should an address match
+            the given template
+
+        Raises:
+            ValueError: If the template is malformed (missing leading slash,
+                empty path segments, unbalanced braces, empty, invalid or
+                duplicated parameter names, OSC wildcard characters in literal
+                parts) or longer than MAX_TEMPLATE_LENGTH characters
+        """
+        if template not in self._templates:
+            self._templates[template] = [_compile_address_template(template), []]
+        handlerobj = Handler(handler, list(args), needs_reply_address)
+        self._templates[template][1].append(handlerobj)
         return handlerobj
 
     @overload
@@ -231,10 +415,63 @@ class Dispatcher(object):
                     f"Address '{address}' doesn't have handler '{handler}' mapped to it"
                 ) from e
 
+    @overload
+    def unmap_template(self, template: str, handler: Handler) -> None:
+        """Remove an already mapped handler from an address template
+
+        Args:
+            template (str): Template to be unmapped
+            handler (Handler): A Handler object as returned from map_template().
+        """
+        pass
+
+    @overload
+    def unmap_template(
+        self,
+        template: str,
+        handler: Callable,
+        *args: Union[Any, List[Any]],
+        needs_reply_address: bool = False,
+    ) -> None:
+        """Remove an already mapped handler from an address template
+
+        Args:
+            template: Template to be unmapped
+            handler: A function that will be run when an address matches the
+                template, with the OscMessage passed as parameter.
+            args: Any additional arguments that will be always passed to the
+                handlers after the osc messages arguments if any.
+            needs_reply_address: True if the handler function needs the
+                originating client address passed (as the first argument).
+        """
+        pass
+
+    def unmap_template(self, template, handler, *args, needs_reply_address=False):
+        if template not in self._templates:
+            raise ValueError(f"Template '{template}' has no handler mapped to it")
+        handlers = self._templates[template][1]
+        try:
+            if isinstance(handler, Handler):
+                handlers.remove(handler)
+            else:
+                handlers.remove(Handler(handler, list(args), needs_reply_address))
+        except ValueError as e:
+            if str(e) == "list.remove(x): x not in list":
+                raise ValueError(
+                    f"Template '{template}' doesn't have handler '{handler}' mapped to it"
+                ) from e
+        if not handlers:
+            del self._templates[template]
+
     def handlers_for_address(
         self, address_pattern: str
     ) -> Generator[Handler, None, None]:
         """Yields handlers matching an address
+
+        Handlers are yielded in a stable priority order: handlers mapped to
+        exact addresses first, then handlers mapped to address templates (in
+        registration order, with the extracted named segments bound to each
+        yielded handler), then handlers mapped to OSC wildcard addresses.
 
         Args:
             address_pattern: Address to match
@@ -292,13 +529,41 @@ class Dispatcher(object):
             return
 
         matched = False
+        exact_handlers: List[Handler] = []
+        wildcard_handlers: List[Handler] = []
         for addr, handlers in self._map.items():
             if patterncompiled.match(addr) or (
                 "*" in addr
                 and re.match(addr.replace("*", ".*?") + "$", address_pattern)
             ):
-                yield from handlers
-                matched = True
+                if any(c in addr for c in "*?[]{"):
+                    wildcard_handlers.extend(handlers)
+                else:
+                    exact_handlers.extend(handlers)
+
+        # Priority 1: exact addresses.
+        for handler in exact_handlers:
+            matched = True
+            yield handler
+
+        # Priority 2: address templates, in registration order. Each yielded
+        # handler is bound to the named segments extracted from the address.
+        for compiled, handlers in self._templates.values():
+            match = compiled.match(address_pattern)
+            if match:
+                for handler in handlers:
+                    matched = True
+                    yield Handler(
+                        handler.callback,
+                        handler.args,
+                        handler.needs_reply_address,
+                        dict(match.groupdict()),
+                    )
+
+        # Priority 3: OSC wildcard addresses.
+        for handler in wildcard_handlers:
+            matched = True
+            yield handler
 
         if not matched and self._default_handler:
             logging.debug("No handler matched but default handler present, added it.")

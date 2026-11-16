@@ -1,6 +1,14 @@
 import unittest
 
-from pythonosc.dispatcher import Dispatcher, Handler
+from pythonosc.dispatcher import Dispatcher, Handler, MAX_TEMPLATE_LENGTH
+from pythonosc.osc_message_builder import OscMessageBuilder
+
+
+def make_dgram(address, *args):
+    builder = OscMessageBuilder(address=address)
+    for arg in args:
+        builder.add_arg(arg)
+    return builder.build().dgram
 
 
 class TestDispatcher(unittest.IsolatedAsyncioTestCase):
@@ -261,6 +269,234 @@ class TestDispatcher(unittest.IsolatedAsyncioTestCase):
             dgram_async, ("127.0.0.1", 1234)
         )
         self.assertTrue(async_called)
+
+
+class TestDispatcherTemplates(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        super().setUp()
+        self.dispatcher = Dispatcher()
+        self.client = ("127.0.0.1", 1234)
+
+    def test_template_matches_two_track_numbers(self):
+        calls = []
+
+        def on_gain(address, *osc_args, id):
+            calls.append((address, id, osc_args))
+
+        self.dispatcher.map_template("/track/{id}/gain", on_gain)
+
+        self.dispatcher.call_handlers_for_packet(
+            make_dgram("/track/7/gain", 0.5), self.client
+        )
+        self.dispatcher.call_handlers_for_packet(
+            make_dgram("/track/8/gain", 0.75), self.client
+        )
+
+        self.assertEqual(
+            [
+                ("/track/7/gain", "7", (0.5,)),
+                ("/track/8/gain", "8", (0.75,)),
+            ],
+            calls,
+        )
+
+    def test_template_does_not_match_other_shapes(self):
+        calls = []
+        self.dispatcher.map_template(
+            "/track/{id}/gain", lambda address, *args, id: calls.append(id)
+        )
+        for address in (
+            "/track/gain",  # missing segment
+            "/track//gain",  # empty segment
+            "/track/7",  # too short
+            "/track/7/gain/extra",  # too long
+            "/track/7/volume",  # different literal tail
+        ):
+            self.dispatcher.call_handlers_for_packet(
+                make_dgram(address), self.client
+            )
+        self.assertEqual([], calls)
+
+    def test_exact_template_wildcard_priority_order(self):
+        fired = []
+        self.dispatcher.map("/track/7/gain", lambda address, *args: fired.append("exact"))
+        self.dispatcher.map_template(
+            "/track/{id}/gain", lambda address, *args, id: fired.append("template")
+        )
+        self.dispatcher.map("/track/*/gain", lambda address, *args: fired.append("wildcard"))
+
+        self.dispatcher.call_handlers_for_packet(
+            make_dgram("/track/7/gain", 1.0), self.client
+        )
+        self.assertEqual(["exact", "template", "wildcard"], fired)
+
+        fired.clear()
+        self.dispatcher.call_handlers_for_packet(
+            make_dgram("/track/8/gain", 1.0), self.client
+        )
+        self.assertEqual(["template", "wildcard"], fired)
+
+    def test_template_registration_order_is_stable(self):
+        fired = []
+        self.dispatcher.map_template(
+            "/track/{id}/gain", lambda address, *args, id: fired.append(("first", id))
+        )
+        self.dispatcher.map_template(
+            "/{kind}/7/gain", lambda address, *args, kind: fired.append(("second", kind))
+        )
+        self.dispatcher.call_handlers_for_packet(
+            make_dgram("/track/7/gain", 1.0), self.client
+        )
+        self.assertEqual([("first", "7"), ("second", "track")], fired)
+
+    def test_template_with_fixed_args(self):
+        calls = []
+
+        def on_gain(address, fixed_args, *osc_args, id):
+            calls.append((address, fixed_args, id, osc_args))
+
+        self.dispatcher.map_template("/track/{id}/gain", on_gain, "fixed1", "fixed2")
+        self.dispatcher.call_handlers_for_packet(
+            make_dgram("/track/7/gain", 0.5), self.client
+        )
+        self.assertEqual(
+            [("/track/7/gain", ["fixed1", "fixed2"], "7", (0.5,))], calls
+        )
+
+    def test_template_with_needs_reply_address(self):
+        calls = []
+
+        def on_gain(client_address, address, *osc_args, id):
+            calls.append((client_address, address, id, osc_args))
+
+        self.dispatcher.map_template(
+            "/track/{id}/gain", on_gain, needs_reply_address=True
+        )
+        self.dispatcher.call_handlers_for_packet(
+            make_dgram("/track/8/gain", 0.25), self.client
+        )
+        self.assertEqual(
+            [(self.client, "/track/8/gain", "8", (0.25,))], calls
+        )
+
+    def test_unmap_template(self):
+        calls = []
+
+        def on_gain(address, *args, id):
+            calls.append(id)
+
+        # Unmap with the handler object returned by map_template.
+        returned = self.dispatcher.map_template("/track/{id}/gain", on_gain)
+        self.dispatcher.call_handlers_for_packet(
+            make_dgram("/track/7/gain", 0.5), self.client
+        )
+        self.assertEqual(["7"], calls)
+        self.dispatcher.unmap_template("/track/{id}/gain", returned)
+        self.dispatcher.call_handlers_for_packet(
+            make_dgram("/track/7/gain", 0.5), self.client
+        )
+        self.assertEqual(["7"], calls)
+
+        # Unmap by reconstructing the handler.
+        self.dispatcher.map_template("/track/{id}/gain", on_gain)
+        self.dispatcher.unmap_template("/track/{id}/gain", on_gain)
+        self.dispatcher.call_handlers_for_packet(
+            make_dgram("/track/7/gain", 0.5), self.client
+        )
+        self.assertEqual(["7"], calls)
+
+    def test_unmap_template_exception(self):
+        def dummyhandler():
+            pass
+
+        with self.assertRaises(ValueError):
+            self.dispatcher.unmap_template("/track/{id}/gain", dummyhandler)
+
+        handlerobj = self.dispatcher.map_template("/track/{id}/gain", dummyhandler())
+        with self.assertRaises(ValueError):
+            self.dispatcher.unmap_template("/other/{id}", handlerobj)
+
+    def test_invalid_templates_raise_value_error(self):
+        def dummyhandler():
+            pass
+
+        bad_templates = [
+            "track/{id}/gain",  # no leading slash
+            "/track//gain",  # empty segment
+            "/track/{id}/",  # trailing empty segment
+            "/",  # only the root
+            "/track/{}/gain",  # empty parameter name
+            "/track/{id}/{id}",  # duplicate parameter name
+            "/track/{id/gain",  # unbalanced '{'
+            "/track/id}/gain",  # unbalanced '}'
+            "/track/{id-1}/gain",  # not a valid identifier
+            "/track/{id}/ga in",  # space not allowed
+            "/track/{a,b}",  # OSC alternation is not a template parameter
+            "/track/*/gain",  # OSC wildcard in literal part
+            "/track/?/gain",
+            "/track/[0-9]/gain",
+            "/" + "a" * MAX_TEMPLATE_LENGTH,  # too long
+        ]
+        for template in bad_templates:
+            with self.subTest(template=template):
+                with self.assertRaises(ValueError):
+                    self.dispatcher.map_template(template, dummyhandler)
+
+    def test_braces_in_map_remain_osc_wildcards(self):
+        # The standard OSC {a,b} alternation still applies to address patterns
+        # matched through map()-registered addresses, and does not extract
+        # named parameters.
+        self.dispatcher.map("/vol/up", 1)
+        self.dispatcher.map("/vol/down", 2)
+        self.sortAndAssertHandlers(
+            [Handler(1, []), Handler(2, [])],
+            self.dispatcher.handlers_for_address("/vol/{up,down}"),
+        )
+
+    def sortAndAssertHandlers(self, expected, result):
+        def sort(lst):
+            return sorted(lst, key=lambda x: x.callback)
+
+        return self.assertSequenceEqual(sort(expected), sort(list(result)))
+
+    def test_template_falls_back_to_default_handler(self):
+        calls = []
+        defaults = []
+        self.dispatcher.map_template(
+            "/track/{id}/gain", lambda address, *args, id: calls.append(id)
+        )
+        self.dispatcher.set_default_handler(
+            lambda address, *args: defaults.append(address)
+        )
+        self.dispatcher.call_handlers_for_packet(
+            make_dgram("/track/7/gain", 0.5), self.client
+        )
+        self.dispatcher.call_handlers_for_packet(
+            make_dgram("/unmapped/address", 0.5), self.client
+        )
+        self.assertEqual(["7"], calls)
+        self.assertEqual(["/unmapped/address"], defaults)
+
+    async def test_template_async_dispatch(self):
+        calls = []
+
+        async def on_gain(address, *osc_args, id):
+            calls.append((address, id, osc_args))
+
+        self.dispatcher.map_template("/track/{id}/gain", on_gain)
+        await self.dispatcher.async_call_handlers_for_packet(
+            make_dgram("/track/7/gain", 0.5), self.client
+        )
+        await self.dispatcher.async_call_handlers_for_packet(
+            make_dgram("/track/8/gain", 0.75), self.client
+        )
+        self.assertEqual(
+            [
+                ("/track/7/gain", "7", (0.5,)),
+                ("/track/8/gain", "8", (0.75,)),
+            ],
+            calls,
+        )
 
 
 if __name__ == "__main__":
