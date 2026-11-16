@@ -73,13 +73,23 @@ class UDPClient(object):
         """Close the socket"""
         self._sock.close()
 
+    def send_bytes(self, data: bytes) -> None:
+        """Sends raw datagram bytes via UDP without parsing or rebuilding them.
+
+        Used by the recorder/player to replay captured datagrams byte for byte.
+
+        Args:
+            data: The raw datagram bytes to send.
+        """
+        self._sock.sendto(data, (self._address, self._port))
+
     def send(self, content: Union[OscMessage, OscBundle]) -> None:
         """Sends an :class:`OscMessage` or :class:`OscBundle` via UDP
 
         Args:
             content: Message or bundle to be sent
         """
-        self._sock.sendto(content.dgram, (self._address, self._port))
+        self.send_bytes(content.dgram)
 
     def receive(self, timeout: float | None = None) -> bytes:
         """Wait :int:`timeout` seconds for a message an return the raw bytes

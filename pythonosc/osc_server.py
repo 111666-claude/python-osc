@@ -1,18 +1,22 @@
 """OSC Servers that receive UDP packets and invoke handlers accordingly."""
 
 import asyncio
+import logging
 import os
 import socket
 import socketserver
 from socket import socket as _socket
-from typing import Any, Coroutine, Tuple, Union, cast
+from typing import Any, Coroutine, Optional, Tuple, Union, cast
 
 from pythonosc import osc_bundle, osc_message
 from pythonosc.dispatcher import Dispatcher
 from pythonosc.osc_message_builder import build_msg
+from pythonosc.udp_recorder import DatagramRecorder
 
 _RequestType = Union[_socket, Tuple[bytes, _socket]]
 _AddressType = Union[Tuple[str, int], str]
+
+logger = logging.getLogger(__name__)
 
 
 class _UDPHandler(socketserver.BaseRequestHandler):
@@ -41,7 +45,7 @@ class _UDPHandler(socketserver.BaseRequestHandler):
             self.socket.sendto(msg.dgram, self.client_address)
 
 
-def _is_valid_request(request: _RequestType) -> bool:
+def _is_valid_request(request: Union[_RequestType, Tuple[bytes]]) -> bool:
     """Returns true if the request's data looks like an osc bundle or message.
 
     Returns:
@@ -69,6 +73,7 @@ class OSCUDPServer(socketserver.UDPServer):
         bind_and_activate: bool = True,
         timeout: float | None = None,
         family: socket.AddressFamily | None = None,
+        recorder: Optional[DatagramRecorder] = None,
     ) -> None:
         """Initialize
 
@@ -78,6 +83,9 @@ class OSCUDPServer(socketserver.UDPServer):
             (optional) bind_and_activate: default=True defines if the server has to start on call of constructor
             (optional) timeout: Default timeout in seconds for socket operations
             (optional) family: socket.AF_INET or socket.AF_INET6. If None, it will be inferred from server_address.
+            (optional) recorder: DatagramRecorder capturing every accepted raw
+                datagram alongside normal dispatch. Recording failures are
+                logged and never interfere with the dispatcher.
         """
         if family is not None:
             self.address_family = family
@@ -98,12 +106,18 @@ class OSCUDPServer(socketserver.UDPServer):
 
         super().__init__(server_address, _UDPHandler, bind_and_activate)
         self._dispatcher = dispatcher
+        self._recorder = recorder
         self.timeout = timeout
 
     def verify_request(
         self, request: _RequestType, client_address: _AddressType
     ) -> bool:
         """Returns true if the data looks like a valid OSC UDP datagram
+
+        Accepted datagrams are handed to the attached recorder (if any) here,
+        on the server's main thread in exact socket arrival order. This keeps
+        recording order correct for the threading and forking flavors too,
+        whose handlers run later on separate threads/processes.
 
         Args:
             request: Incoming data
@@ -112,11 +126,23 @@ class OSCUDPServer(socketserver.UDPServer):
         Returns:
             True if request is OSC bundle or OSC message
         """
-        return _is_valid_request(request)
+        valid = _is_valid_request(request)
+        if valid and self._recorder is not None and isinstance(request, tuple):
+            try:
+                # Raw bytes only: parsing/rewriting would alter bundle timetags.
+                self._recorder.record(request[0])
+            except Exception:  # recording must never break normal dispatch
+                logger.warning("failed to record OSC datagram", exc_info=True)
+        return valid
 
     @property
     def dispatcher(self) -> Dispatcher:
         return self._dispatcher
+
+    @property
+    def recorder(self) -> Optional[DatagramRecorder]:
+        """Recorder attached to this server, or None."""
+        return self._recorder
 
 
 class BlockingOSCUDPServer(OSCUDPServer):
@@ -158,6 +184,7 @@ class AsyncIOOSCUDPServer:
         server_address: Tuple[str, int],
         dispatcher: Dispatcher,
         loop: asyncio.BaseEventLoop,
+        recorder: Optional[DatagramRecorder] = None,
     ) -> None:
         """Initialize
 
@@ -166,17 +193,26 @@ class AsyncIOOSCUDPServer:
             dispatcher: Dispatcher this server shall use
             loop: Event loop to add the server task to. Use ``asyncio.get_event_loop()`` unless you know what you're
                 doing.
+            recorder: Optional DatagramRecorder capturing every valid raw
+                datagram alongside normal dispatch. Recording failures are
+                logged and never interfere with the dispatcher.
         """
 
         self._server_address = server_address
         self._dispatcher = dispatcher
         self._loop = loop
+        self._recorder = recorder
 
     class _OSCProtocolFactory(asyncio.DatagramProtocol):
         """OSC protocol factory which passes datagrams to dispatcher"""
 
-        def __init__(self, dispatcher: Dispatcher) -> None:
+        def __init__(
+            self,
+            dispatcher: Dispatcher,
+            recorder: Optional[DatagramRecorder] = None,
+        ) -> None:
             self.dispatcher = dispatcher
+            self.recorder = recorder
 
         def connection_made(self, transport):
             self.transport = transport
@@ -184,6 +220,14 @@ class AsyncIOOSCUDPServer:
         def datagram_received(
             self, data: bytes, client_address: Tuple[str, int]
         ) -> None:
+            # Gate recording on the same sanity check the sync servers use in
+            # verify_request; dispatch itself is unchanged and still receives
+            # every datagram.
+            if self.recorder is not None and _is_valid_request((data,)):
+                try:
+                    self.recorder.record(data)
+                except Exception:  # recording must never break normal dispatch
+                    logger.warning("failed to record OSC datagram", exc_info=True)
             resp = self.dispatcher.call_handlers_for_packet(data, client_address)
             for r in resp:
                 if not isinstance(r, tuple):
@@ -210,10 +254,15 @@ class AsyncIOOSCUDPServer:
             Awaitable coroutine that returns transport and protocol objects
         """
         return self._loop.create_datagram_endpoint(
-            lambda: self._OSCProtocolFactory(self.dispatcher),
+            lambda: self._OSCProtocolFactory(self.dispatcher, self._recorder),
             local_addr=self._server_address,
         )
 
     @property
     def dispatcher(self) -> Dispatcher:
         return self._dispatcher
+
+    @property
+    def recorder(self) -> Optional[DatagramRecorder]:
+        """Recorder attached to this server, or None."""
+        return self._recorder

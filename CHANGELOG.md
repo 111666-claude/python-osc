@@ -6,6 +6,7 @@ The format is based on [Keep a Changelog](http://keepachangelog.com/) and this p
 ## Unreleased
 
 - Preserve explicit empty-string arguments in message helpers and TCP clients while keeping omitted values argument-free.
+- Added optional `DatagramRecorder`/`DatagramPlayer` for recording raw UDP datagrams with monotonic relative timestamps and replaying them at a configurable rate, with capacity/overflow policies and cancellation. UDP servers accept an optional `recorder` argument; `UDPClient` gained `send_bytes()` for raw-datagram replay.
 
 ## [1.10.2]
 
