@@ -5,10 +5,17 @@ import collections
 import inspect
 import logging
 import re
+import threading
 import time
 from pythonosc import osc_packet
+from pythonosc.osc_query import (
+    ACCESS_VALUES,
+    OscQueryMetadata,
+    validate_osc_address,
+)
 from typing import (
     overload,
+    Dict,
     List,
     Union,
     Any,
@@ -142,6 +149,10 @@ class Dispatcher(object):
         self._map: DefaultDict[str, List[Handler]] = collections.defaultdict(list)
         self._default_handler: Optional[Handler] = None
         self._strict_timing = strict_timing
+        # Guards registration state (_map / _oscquery_metadata) for the
+        # discovery snapshot; the packet-dispatch path stays lock-free.
+        self._registration_lock = threading.RLock()
+        self._oscquery_metadata: Dict[str, OscQueryMetadata] = {}
 
     def map(
         self,
@@ -149,6 +160,9 @@ class Dispatcher(object):
         handler: Callable,
         *args: Union[Any, List[Any]],
         needs_reply_address: bool = False,
+        oscquery_type: Optional[str] = None,
+        oscquery_description: Optional[str] = None,
+        oscquery_access: Optional[str] = None,
     ) -> Handler:
         """Map an address to a handler
 
@@ -174,16 +188,50 @@ class Dispatcher(object):
             *args: Fixed arguements that will be passed to the callback function
             needs_reply_address: Whether the IP address from which the message originated from shall be passed as
                 an argument to the handler callback
+            oscquery_type: Optional OSC type tag string published by the OSCQuery
+                discovery service for this address (e.g. "f").
+            oscquery_description: Optional human-readable description published by
+                the OSCQuery discovery service.
+            oscquery_access: Optional access flag published by the OSCQuery
+                discovery service; one of "read", "write", "readwrite".
 
         Returns:
             The handler object that will be invoked should the given address match
 
+        Raises:
+            ValueError: If OSCQuery metadata is supplied for an invalid address,
+                if oscquery_access is not a known value, or if the address was
+                already registered with different OSCQuery metadata.
         """
         # TODO: Check the spec:
         # http://opensoundcontrol.org/spec-1_0
         # regarding multiple mappings
         handlerobj = Handler(handler, list(args), needs_reply_address)
-        self._map[address].append(handlerobj)
+        with self._registration_lock:
+            metadata = None
+            if (
+                oscquery_type is not None
+                or oscquery_description is not None
+                or oscquery_access is not None
+            ):
+                validate_osc_address(address)
+                if oscquery_access is not None and oscquery_access not in ACCESS_VALUES:
+                    raise ValueError(
+                        f"oscquery_access must be one of {ACCESS_VALUES}, "
+                        f"got {oscquery_access!r}"
+                    )
+                metadata = OscQueryMetadata(
+                    oscquery_type, oscquery_description, oscquery_access
+                )
+                existing = self._oscquery_metadata.get(address)
+                if existing is not None and existing != metadata:
+                    raise ValueError(
+                        f"Conflicting OSCQuery metadata for address '{address}': "
+                        f"{existing!r} already registered, got {metadata!r}"
+                    )
+            self._map[address].append(handlerobj)
+            if metadata is not None:
+                self._oscquery_metadata[address] = metadata
         return handlerobj
 
     @overload
@@ -218,18 +266,37 @@ class Dispatcher(object):
         pass
 
     def unmap(self, address, handler, *args, needs_reply_address=False):
-        try:
-            if isinstance(handler, Handler):
-                self._map[address].remove(handler)
-            else:
-                self._map[address].remove(
-                    Handler(handler, list(args), needs_reply_address)
-                )
-        except ValueError as e:
-            if str(e) == "list.remove(x): x not in list":
-                raise ValueError(
-                    f"Address '{address}' doesn't have handler '{handler}' mapped to it"
-                ) from e
+        with self._registration_lock:
+            try:
+                if isinstance(handler, Handler):
+                    self._map[address].remove(handler)
+                else:
+                    self._map[address].remove(
+                        Handler(handler, list(args), needs_reply_address)
+                    )
+            except ValueError as e:
+                if str(e) == "list.remove(x): x not in list":
+                    raise ValueError(
+                        f"Address '{address}' doesn't have handler '{handler}' mapped to it"
+                    ) from e
+            if not self._map[address]:
+                # Last handler gone: drop the entry and its discovery metadata.
+                del self._map[address]
+                self._oscquery_metadata.pop(address, None)
+
+    def oscquery_snapshot(self) -> Tuple[List[str], Dict[str, OscQueryMetadata]]:
+        """Return a consistent snapshot of registered addresses and metadata.
+
+        Returns:
+            A tuple of the sorted list of explicitly mapped addresses (those
+            with at least one handler) and a copy of the OSCQuery metadata
+            mapping. Used by the read-only discovery service; acquiring the
+            registration lock here keeps concurrent map/unmap calls from
+            producing torn trees.
+        """
+        with self._registration_lock:
+            addresses = sorted(addr for addr, handlers in self._map.items() if handlers)
+            return addresses, dict(self._oscquery_metadata)
 
     def handlers_for_address(
         self, address_pattern: str
