@@ -127,6 +127,16 @@ class OSCTCPServer(socketserver.TCPServer):
 
         super().__init__(server_address, TCPHandler)
 
+    def server_close(self) -> None:
+        """Close the server and stop the dispatcher's rate limit scheduling.
+
+        Queued rate limited messages are dropped; call
+        ``dispatcher.shutdown(flush=True)`` before closing if they must be
+        delivered first. Idempotent.
+        """
+        super().server_close()
+        self.dispatcher.shutdown()
+
 
 class BlockingOSCTCPServer(OSCTCPServer):
     """Blocking version of the TCP server.
@@ -196,6 +206,7 @@ class AsyncOSCTCPServer:
     async def stop(self) -> None:
         self._server.close()
         await self._server.wait_closed()
+        await self.dispatcher.ashutdown()
 
     async def handle(
         self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter

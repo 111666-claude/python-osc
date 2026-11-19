@@ -5,6 +5,12 @@ The format is based on [Keep a Changelog](http://keepachangelog.com/) and this p
 
 ## Unreleased
 
+- Per-address rate limiting for `Dispatcher.map`: optional `rate`, `burst` and
+  overflow policy (`DROP_OLDEST` to keep the latest value or `REJECT_NEW` to
+  refuse new messages), with independent token buckets and bounded queues per
+  matched route, injectable virtual clock, runtime reconfiguration, per-route
+  statistics and deterministic shutdown (flush or drop) for both synchronous
+  and asynchronous servers. Bundle timetags remain honored while queued.
 - Preserve explicit empty-string arguments in message helpers and TCP clients while keeping omitted values argument-free.
 
 ## [1.10.2]

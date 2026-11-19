@@ -114,6 +114,16 @@ class OSCUDPServer(socketserver.UDPServer):
         """
         return _is_valid_request(request)
 
+    def server_close(self) -> None:
+        """Close the server and stop the dispatcher's rate limit scheduling.
+
+        Queued rate limited messages are dropped; call
+        ``dispatcher.shutdown(flush=True)`` before closing if they must be
+        delivered first. Idempotent.
+        """
+        super().server_close()
+        self._dispatcher.shutdown()
+
     @property
     def dispatcher(self) -> Dispatcher:
         return self._dispatcher
@@ -213,6 +223,32 @@ class AsyncIOOSCUDPServer:
             lambda: self._OSCProtocolFactory(self.dispatcher),
             local_addr=self._server_address,
         )
+
+    def close(self, flush: bool = False) -> int:
+        """Stop rate limit scheduling synchronously.
+
+        Use this from synchronous code that created the server with
+        :meth:`serve`. For code running inside the event loop prefer
+        :meth:`aclose`.
+
+        Args:
+            flush: Deliver queued messages before closing when True.
+
+        Returns:
+            Number of queued messages dropped.
+        """
+        return self._dispatcher.shutdown(flush=flush)
+
+    async def aclose(self, flush: bool = False) -> int:
+        """Stop the async rate limit drain task and close the dispatcher.
+
+        Args:
+            flush: Deliver queued messages before closing when True.
+
+        Returns:
+            Number of queued messages dropped.
+        """
+        return await self._dispatcher.ashutdown(flush=flush)
 
     @property
     def dispatcher(self) -> Dispatcher:

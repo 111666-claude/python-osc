@@ -109,6 +109,68 @@ Alternatively the handler can be reconstructed from a function and optional fixe
 If the provided mapping doesn't exist, a ``ValueError`` is raised.
 
 
+Rate Limiting
+---------------
+
+A high-frequency OSC source (for example a controller continuously streaming
+knob values) can monopolize a dispatcher and starve messages on slower
+addresses. To prevent that, a mapped address can be given its own rate limit
+by passing ``rate`` (messages per second) and optionally ``burst`` (the
+maximum number of messages that may be delivered at once) to
+``Dispatcher.map``. Each rate limited address gets an independent token bucket
+plus a bounded queue, so one busy address can never consume the budget of
+another:
+
+.. code-block:: python
+
+    from pythonosc.rate_limit import OverflowPolicy
+
+    # At most 30 knob messages per second, allowing an initial burst of 5.
+    disp.map("/knob", knob_handler, rate=30, burst=5)
+
+When a message arrives and no token is available it is queued (the queue holds
+up to ``burst`` messages) and delivered later, in order, as tokens refill. Two
+overflow strategies decide what happens when that queue is full:
+
+* ``OverflowPolicy.DROP_OLDEST`` (the default): the oldest queued message is
+  discarded so the newest value survives. Use this when only the latest value
+  matters (typical for continuous controller positions).
+* ``OverflowPolicy.REJECT_NEW``: the incoming message is dropped and the
+  already queued messages are preserved.
+
+.. code-block:: python
+
+    disp.map(
+        "/knob",
+        knob_handler,
+        rate=30,
+        burst=5,
+        overflow_policy=OverflowPolicy.REJECT_NEW,
+    )
+
+Per-address counters are available for monitoring:
+
+.. code-block:: python
+
+    stats = disp.rate_limit_stats("/knob")
+    print(stats.delivered, stats.rejected, stats.dropped_old)
+
+Messages inside bundles keep honoring their timetags: a future-dated message is
+held until both its token and its timetag are due. An address's rate limit can
+be changed or removed at runtime with ``Dispatcher.set_rate_limit`` (pass
+``rate=None`` to remove it).
+
+Rate limiting runs on the same clock as bundle timing. By default a background
+scheduler thread (synchronous servers) or asyncio task (asynchronous servers)
+releases queued messages without needing further traffic; both are stopped
+deterministically by ``Dispatcher.shutdown`` (or the server's ``server_close`` /
+``aclose``), optionally flushing the queues first. For deterministic tests a
+virtual clock and manual draining can be injected through the ``Dispatcher``
+constructor's ``clock``, ``sleep`` and ``auto_schedule=False`` arguments, and
+queued messages can then be released explicitly with ``drain_pending`` /
+``adrain_pending``.
+
+
 Default Handler
 -----------------
 
